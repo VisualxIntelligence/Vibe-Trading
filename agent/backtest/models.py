@@ -5,9 +5,189 @@ Immutable dataclasses for positions, trades, and equity snapshots.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import pandas as pd
+
+
+ORDER_STATUSES = {
+    "open",
+    "partially_filled",
+    "filled",
+    "cancelled",
+    "expired",
+    "rejected",
+}
+ORDER_TYPES = {"market", "limit"}
+TIME_IN_FORCE_VALUES = {"GTC", "IOC", "FOK"}
+
+
+@dataclass
+class OrderRecord:
+    """Mutable order lifecycle supporting one or more execution fills."""
+
+    order_id: str
+    symbol: str
+    side: str
+    event_type: str
+    direction: int
+    requested_quantity: float
+    created_time: pd.Timestamp
+    decision_price: float
+    reason: str
+    filled_quantity: float = 0.0
+    remaining_quantity: float | None = None
+    cancelled_quantity: float = 0.0
+    status: str = "open"
+    updated_time: pd.Timestamp | None = None
+    signal_time: pd.Timestamp | None = None
+    volume_constrained: bool = False
+    volume_constrained_bars: int = 0
+    order_type: str = "market"
+    limit_price: float | None = None
+    time_in_force: str = "GTC"
+    created_bar_index: int = 0
+    eligible_bar_index: int = 0
+    eligible_time: pd.Timestamp | None = None
+    expires_bar_index: int | None = None
+    expires_time: pd.Timestamp | None = None
+    attempt_count: int = 0
+    deferred_bars: int = 0
+    unfilled_eligible_bars: int = 0
+    first_fill_time: pd.Timestamp | None = None
+    last_fill_time: pd.Timestamp | None = None
+    status_reason: str = ""
+
+    def __post_init__(self) -> None:
+        self.requested_quantity = max(float(self.requested_quantity), 0.0)
+        self.filled_quantity = max(float(self.filled_quantity), 0.0)
+        if self.remaining_quantity is None:
+            self.remaining_quantity = max(
+                self.requested_quantity - self.filled_quantity,
+                0.0,
+            )
+        else:
+            self.remaining_quantity = max(float(self.remaining_quantity), 0.0)
+        self.cancelled_quantity = max(float(self.cancelled_quantity), 0.0)
+        self.order_type = str(self.order_type).lower()
+        self.time_in_force = str(self.time_in_force).upper()
+        self.created_bar_index = max(int(self.created_bar_index), 0)
+        self.eligible_bar_index = max(
+            int(self.eligible_bar_index), self.created_bar_index,
+        )
+        if self.expires_bar_index is not None:
+            self.expires_bar_index = int(self.expires_bar_index)
+            if self.expires_bar_index < self.created_bar_index:
+                raise ValueError(
+                    "expires_bar_index cannot precede created_bar_index"
+                )
+        self.attempt_count = max(int(self.attempt_count), 0)
+        self.deferred_bars = max(int(self.deferred_bars), 0)
+        self.unfilled_eligible_bars = max(int(self.unfilled_eligible_bars), 0)
+        if self.status not in ORDER_STATUSES:
+            raise ValueError(f"unsupported order status: {self.status!r}")
+        if self.order_type not in ORDER_TYPES:
+            raise ValueError(f"unsupported order type: {self.order_type!r}")
+        if self.time_in_force not in TIME_IN_FORCE_VALUES:
+            raise ValueError(
+                f"unsupported time in force: {self.time_in_force!r}"
+            )
+        if self.order_type == "limit" and self.status != "rejected":
+            if (
+                self.limit_price is None
+                or not pd.notna(self.limit_price)
+                or not math.isfinite(float(self.limit_price))
+                or float(self.limit_price) <= 0.0
+            ):
+                raise ValueError("limit orders require a positive limit price")
+            self.limit_price = float(self.limit_price)
+        if self.filled_quantity - self.requested_quantity > 1e-9:
+            raise ValueError("filled quantity cannot exceed requested quantity")
+
+    def record_fill(self, quantity: float, timestamp: pd.Timestamp) -> None:
+        """Apply an executed quantity and advance the order status."""
+        if self.status not in {"open", "partially_filled"}:
+            raise ValueError(f"cannot fill order in status {self.status!r}")
+        executed = float(quantity)
+        if executed <= 0.0:
+            raise ValueError("fill quantity must be positive")
+        remaining = float(self.remaining_quantity or 0.0)
+        if executed - remaining > 1e-9:
+            raise ValueError("fill quantity exceeds remaining quantity")
+        self.filled_quantity += executed
+        self.remaining_quantity = max(remaining - executed, 0.0)
+        self.updated_time = pd.Timestamp(timestamp)
+        if self.first_fill_time is None:
+            self.first_fill_time = pd.Timestamp(timestamp)
+        self.last_fill_time = pd.Timestamp(timestamp)
+        self.status = (
+            "filled" if self.remaining_quantity <= 1e-9 else "partially_filled"
+        )
+
+    def cancel(
+        self,
+        timestamp: pd.Timestamp,
+        reason: str = "cancelled",
+    ) -> None:
+        """Cancel only the unfilled residual quantity."""
+        self._terminate("cancelled", timestamp, reason)
+
+    def expire(
+        self,
+        timestamp: pd.Timestamp,
+        reason: str = "expired",
+    ) -> None:
+        """Expire the unfilled residual while preserving prior fills."""
+        self._terminate("expired", timestamp, reason)
+
+    def reject(
+        self,
+        timestamp: pd.Timestamp,
+        reason: str = "venue_rejected",
+    ) -> None:
+        """Reject the unfilled residual while preserving prior fills."""
+        self._terminate("rejected", timestamp, reason)
+
+    def _terminate(
+        self,
+        status: str,
+        timestamp: pd.Timestamp,
+        reason: str,
+    ) -> None:
+        """Move a live order to one deterministic terminal state."""
+        if self.status in {"filled", "cancelled", "expired", "rejected"}:
+            return
+        self.cancelled_quantity += float(self.remaining_quantity or 0.0)
+        self.remaining_quantity = 0.0
+        self.updated_time = pd.Timestamp(timestamp)
+        self.status = status
+        self.status_reason = str(reason)
+
+    def record_attempt(self, timestamp: pd.Timestamp) -> None:
+        """Record one eligible venue execution attempt."""
+        self.attempt_count += 1
+        self.updated_time = pd.Timestamp(timestamp)
+
+    def record_deferred(self, timestamp: pd.Timestamp) -> None:
+        """Record one bar skipped because execution was not yet eligible."""
+        self.deferred_bars += 1
+        self.updated_time = pd.Timestamp(timestamp)
+
+    def record_unfilled(self, timestamp: pd.Timestamp) -> None:
+        """Record one eligible bar that produced no execution."""
+        self.unfilled_eligible_bars += 1
+        self.updated_time = pd.Timestamp(timestamp)
+
+    def set_eligible_time(self, timestamp: pd.Timestamp) -> None:
+        """Capture the first concrete timestamp at which execution was allowed."""
+        if self.eligible_time is None:
+            self.eligible_time = pd.Timestamp(timestamp)
+
+    def record_volume_constraint(self) -> None:
+        """Record one bar where available venue volume limited this order."""
+        self.volume_constrained = True
+        self.volume_constrained_bars += 1
 
 
 @dataclass(frozen=True)
@@ -33,6 +213,9 @@ class Position:
     leverage: float = 1.0
     entry_bar_idx: int = 0
     entry_commission: float = 0.0
+    entry_decision_price: float | None = None
+    entry_slippage_cost: float = 0.0
+    signal_time: pd.Timestamp | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +255,51 @@ class TradeRecord:
     commission: float
     entry_margin: float = 0.0
     exit_margin: float = 0.0
+    signal_time: pd.Timestamp | None = None
+    entry_decision_price: float | None = None
+    exit_decision_price: float | None = None
+    gross_pnl: float | None = None
+    slippage_cost: float = 0.0
+    net_pnl: float | None = None
+    holding_days: int | None = None
+
+
+@dataclass(frozen=True)
+class FillRecord:
+    """A single executed entry or exit fill captured at execution time.
+
+    ``direction`` is the position direction (``1`` long, ``-1`` short), while
+    ``side`` describes the actual order side (``buy`` or ``sell``).  Notional
+    intentionally follows the shared ledger convention of absolute quantity
+    times fill price.
+    """
+
+    timestamp: pd.Timestamp
+    symbol: str
+    side: str
+    event_type: str
+    direction: int
+    quantity: float
+    decision_price: float
+    fill_price: float
+    notional: float
+    commission: float
+    slippage_cost: float
+    reason: str
+    order_id: str = ""
+    requested_quantity: float | None = None
+    remaining_quantity: float | None = None
+    fill_status: str = "filled"
+    bar_volume: float | None = None
+    participation_rate: float | None = None
+    bar_volume_capacity: float | None = None
+    volume_limit_exempt: bool = False
+    order_type: str = "market"
+    limit_price: float | None = None
+    eligible_time: pd.Timestamp | None = None
+    eligible_bar_index: int | None = None
+    execution_bar_index: int | None = None
+    time_in_force: str = "GTC"
 
 
 @dataclass(frozen=True)

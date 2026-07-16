@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from backtest.models import TradeRecord
+from backtest.models import FillRecord, OrderRecord, TradeRecord
 
 # ─── Annualisation factor mapping ───
 
@@ -213,7 +213,274 @@ def calc_trade_turnover_series(
                 traded_margin.loc[timestamp] += margin_value
 
     denominator = 2.0 * equity_curve.abs().replace(0.0, np.nan)
-    return (traded_margin / denominator).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return (
+        (traded_margin / denominator)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+
+def calc_execution_metrics(
+    executed_positions: pd.DataFrame,
+    fills: List[FillRecord],
+    observation_count: int,
+    bars_per_year: Optional[int] = 252,
+    orders: Optional[List[OrderRecord]] = None,
+) -> Dict[str, float]:
+    """Calculate scalar cost, turnover, and exposure metrics from executions.
+
+    Turnover and exposure are based on actual executed weights, not target
+    weights. Annualized turnover scales the observed one-way turnover by the
+    number of observations and the effective bars-per-year value.
+    """
+    positions = (
+        executed_positions.fillna(0.0)
+        if executed_positions is not None
+        else pd.DataFrame()
+    )
+    turnover = calc_turnover_series(positions)
+    total_turnover = float(turnover.sum()) if not turnover.empty else 0.0
+
+    n_obs = max(int(observation_count), 0)
+    if bars_per_year is None:
+        if n_obs > 1 and isinstance(positions.index, pd.DatetimeIndex):
+            elapsed_days = max((positions.index[-1] - positions.index[0]).days, 0)
+            years = elapsed_days / 365.25 if elapsed_days > 0 else 0.0
+            effective_bpy = n_obs / years if years > 0 else float(n_obs)
+        else:
+            effective_bpy = float(n_obs)
+    else:
+        effective_bpy = max(float(bars_per_year), 0.0)
+    annualized_turnover = (
+        total_turnover * effective_bpy / n_obs if n_obs > 0 else 0.0
+    )
+
+    total_commission = float(sum(fill.commission for fill in fills))
+    total_slippage = float(sum(fill.slippage_cost for fill in fills))
+    order_records = orders or []
+    total_requested = float(sum(order.requested_quantity for order in order_records))
+    total_filled = float(sum(order.filled_quantity for order in order_records))
+    total_cancelled = float(sum(order.cancelled_quantity for order in order_records))
+    total_unfilled = float(sum(
+        max(order.requested_quantity - order.filled_quantity, 0.0)
+        for order in order_records
+    ))
+    fills_by_order: Dict[str, int] = {}
+    fill_quantity_by_order: Dict[str, float] = {}
+    for fill in fills:
+        if fill.order_id:
+            fills_by_order[fill.order_id] = fills_by_order.get(fill.order_id, 0) + 1
+            fill_quantity_by_order[fill.order_id] = (
+                fill_quantity_by_order.get(fill.order_id, 0.0)
+                + abs(float(fill.quantity))
+            )
+    partial_fill_orders = sum(
+        order.filled_quantity > 0
+        and (
+            fills_by_order.get(order.order_id, 0) > 1
+            or order.filled_quantity + 1e-9 < order.requested_quantity
+        )
+        for order in order_records
+    )
+
+    order_ids = {order.order_id for order in order_records}
+    unlinked_fills = sum(not bool(fill.order_id) for fill in fills)
+    orphan_fills = sum(
+        bool(fill.order_id) and fill.order_id not in order_ids for fill in fills
+    )
+    fill_quantity_mismatches = 0
+    lifecycle_violations = 0
+    for order in order_records:
+        tolerance = max(1e-9, order.requested_quantity * 1e-9)
+        recorded_fill_quantity = fill_quantity_by_order.get(order.order_id, 0.0)
+        if abs(recorded_fill_quantity - order.filled_quantity) > tolerance:
+            fill_quantity_mismatches += 1
+
+        lifecycle_total = (
+            order.filled_quantity
+            + float(order.remaining_quantity or 0.0)
+            + order.cancelled_quantity
+        )
+        lifecycle_valid = (
+            abs(order.requested_quantity - lifecycle_total) <= tolerance
+        )
+        if order.status == "filled":
+            lifecycle_valid = lifecycle_valid and (
+                float(order.remaining_quantity or 0.0) <= tolerance
+                and order.cancelled_quantity <= tolerance
+            )
+        elif order.status in {"cancelled", "expired", "rejected"}:
+            lifecycle_valid = lifecycle_valid and (
+                float(order.remaining_quantity or 0.0) <= tolerance
+            )
+        else:
+            lifecycle_valid = lifecycle_valid and (
+                float(order.remaining_quantity or 0.0) > tolerance
+            )
+        if not lifecycle_valid:
+            lifecycle_violations += 1
+
+    limit_price_violations = 0
+    execution_before_eligibility = 0
+    for fill in fills:
+        tolerance = max(1e-9, abs(float(fill.fill_price)) * 1e-9)
+        if fill.order_type == "limit" and fill.limit_price is not None:
+            limit_price = float(fill.limit_price)
+            if (
+                (fill.side == "buy" and fill.fill_price > limit_price + tolerance)
+                or (fill.side == "sell" and fill.fill_price < limit_price - tolerance)
+            ):
+                limit_price_violations += 1
+        if (
+            fill.eligible_bar_index is not None
+            and fill.execution_bar_index is not None
+        ):
+            if fill.execution_bar_index < fill.eligible_bar_index:
+                execution_before_eligibility += 1
+        elif fill.eligible_time is not None:
+            if pd.Timestamp(fill.timestamp) < pd.Timestamp(fill.eligible_time):
+                execution_before_eligibility += 1
+
+    volume_constrained_orders = sum(
+        bool(order.volume_constrained) for order in order_records
+    )
+    volume_constraint_events = sum(
+        max(int(order.volume_constrained_bars), 0) for order in order_records
+    )
+    exempt_volume_fills = sum(
+        bool(fill.volume_limit_exempt) for fill in fills
+    )
+    participation_fill_quantity = float(sum(
+        abs(float(fill.quantity))
+        for fill in fills
+        if fill.participation_rate is not None and not fill.volume_limit_exempt
+    ))
+
+    # A bar can contain more than one fill (for example, an exit followed by
+    # a reversal entry). Validate the cap against their aggregate quantity,
+    # not each fill independently.
+    volume_by_bar: Dict[tuple[pd.Timestamp, str], Dict[str, float]] = {}
+    for fill in fills:
+        if fill.participation_rate is None or fill.volume_limit_exempt:
+            continue
+        key = (pd.Timestamp(fill.timestamp), fill.symbol)
+        bucket = volume_by_bar.setdefault(key, {
+            "quantity": 0.0,
+            "bar_volume": 0.0,
+            "capacity": 0.0,
+        })
+        bucket["quantity"] += abs(float(fill.quantity))
+        if fill.bar_volume is not None:
+            bucket["bar_volume"] = max(float(fill.bar_volume), 0.0)
+        if fill.bar_volume_capacity is not None:
+            bucket["capacity"] = max(float(fill.bar_volume_capacity), 0.0)
+
+    observed_participation = []
+    volume_limit_violations = 0
+    for bucket in volume_by_bar.values():
+        quantity = bucket["quantity"]
+        bar_volume = bucket["bar_volume"]
+        capacity = bucket["capacity"]
+        if bar_volume > 0.0:
+            observed_participation.append(quantity / bar_volume)
+        tolerance = max(1e-9, capacity * 1e-9)
+        if quantity > capacity + tolerance:
+            volume_limit_violations += 1
+
+    if positions.empty:
+        gross_exposure = pd.Series(dtype=float)
+        net_exposure = pd.Series(dtype=float)
+        active_positions = pd.Series(dtype=float)
+    else:
+        gross_exposure = positions.abs().sum(axis=1)
+        net_exposure = positions.sum(axis=1)
+        active_positions = positions.ne(0.0).sum(axis=1)
+
+    return {
+        "total_commission": total_commission,
+        "total_slippage_cost": total_slippage,
+        "total_trading_cost": total_commission + total_slippage,
+        "order_count": float(len(order_records)),
+        "filled_order_count": float(sum(
+            order.status == "filled" for order in order_records
+        )),
+        "cancelled_order_count": float(sum(
+            order.status == "cancelled" for order in order_records
+        )),
+        "expired_order_count": float(sum(
+            order.status == "expired" for order in order_records
+        )),
+        "rejected_order_count": float(sum(
+            order.status == "rejected" for order in order_records
+        )),
+        "market_order_count": float(sum(
+            order.order_type == "market" for order in order_records
+        )),
+        "limit_order_count": float(sum(
+            order.order_type == "limit" for order in order_records
+        )),
+        "ioc_order_count": float(sum(
+            order.time_in_force == "IOC" for order in order_records
+        )),
+        "fok_order_count": float(sum(
+            order.time_in_force == "FOK" for order in order_records
+        )),
+        "deferred_order_count": float(sum(
+            order.deferred_bars > 0 for order in order_records
+        )),
+        "total_deferred_bars": float(sum(
+            order.deferred_bars for order in order_records
+        )),
+        "total_execution_attempts": float(sum(
+            order.attempt_count for order in order_records
+        )),
+        "total_unfilled_eligible_bars": float(sum(
+            order.unfilled_eligible_bars for order in order_records
+        )),
+        "limit_fill_count": float(sum(
+            fill.order_type == "limit" for fill in fills
+        )),
+        "limit_price_violation_count": float(limit_price_violations),
+        "execution_before_eligibility_count": float(
+            execution_before_eligibility
+        ),
+        "unlinked_fill_count": float(unlinked_fills),
+        "orphan_fill_count": float(orphan_fills),
+        "fill_quantity_mismatch_count": float(fill_quantity_mismatches),
+        "order_lifecycle_violation_count": float(lifecycle_violations),
+        "partial_fill_order_count": float(partial_fill_orders),
+        "volume_constrained_order_count": float(volume_constrained_orders),
+        "volume_constraint_event_count": float(volume_constraint_events),
+        "volume_limit_exempt_fill_count": float(exempt_volume_fills),
+        "volume_participation_fill_quantity": participation_fill_quantity,
+        "max_observed_volume_participation": (
+            float(max(observed_participation)) if observed_participation else 0.0
+        ),
+        "mean_observed_volume_participation": (
+            float(np.mean(observed_participation))
+            if observed_participation else 0.0
+        ),
+        "volume_limit_violation_count": float(volume_limit_violations),
+        "total_requested_quantity": total_requested,
+        "total_filled_quantity": total_filled,
+        "total_cancelled_quantity": total_cancelled,
+        "total_unfilled_quantity": total_unfilled,
+        "fill_ratio": total_filled / total_requested if total_requested > 0 else 0.0,
+        "total_one_way_turnover": total_turnover,
+        "annualized_one_way_turnover": float(annualized_turnover),
+        "mean_gross_exposure": (
+            float(gross_exposure.mean()) if not gross_exposure.empty else 0.0
+        ),
+        "maximum_gross_exposure": (
+            float(gross_exposure.max()) if not gross_exposure.empty else 0.0
+        ),
+        "mean_net_exposure": (
+            float(net_exposure.mean()) if not net_exposure.empty else 0.0
+        ),
+        "mean_active_positions": (
+            float(active_positions.mean()) if not active_positions.empty else 0.0
+        ),
+    }
 
 
 def calc_metrics(
