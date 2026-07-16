@@ -401,6 +401,7 @@ def _provider_key_env(provider: str | None) -> str | None:
     return {
         "openrouter": "OPENROUTER_API_KEY",
         "requesty": "REQUESTY_API_KEY",
+        "anyrouter": "ANYROUTER_API_KEY",
         "openai": "OPENAI_API_KEY",
         "deepseek": "DEEPSEEK_API_KEY",
         "nvidia": "NVIDIA_API_KEY",
@@ -422,6 +423,7 @@ def _provider_base_env(provider: str | None) -> str | None:
     return {
         "openrouter": "OPENROUTER_BASE_URL",
         "requesty": "REQUESTY_BASE_URL",
+        "anyrouter": "ANYROUTER_BASE_URL",
         "openai": "OPENAI_BASE_URL",
         "openai-codex": "OPENAI_CODEX_BASE_URL",
         "deepseek": "DEEPSEEK_BASE_URL",
@@ -4653,6 +4655,16 @@ _PROVIDER_CHOICES: list[dict[str, str | None]] = [
         "key_placeholder": "api-key...",
     },
     {
+        "label": "AnyRouter (Responses API - Responses-native models)",
+        "provider": "anyrouter",
+        "key_env": "ANYROUTER_API_KEY",
+        "base_env": "ANYROUTER_BASE_URL",
+        "base_url": "https://anyrouter.dev/api/v1",
+        "model": "openai/gpt-5.6-sol",
+        "key_prefix": "sk-ar-",
+        "key_placeholder": "sk-ar-v1-...",
+    },
+    {
         "label": "DeepSeek",
         "provider": "deepseek",
         "key_env": "DEEPSEEK_API_KEY",
@@ -4801,6 +4813,8 @@ def _render_env_content(config: dict[str, str]) -> str:
         "OPENROUTER_BASE_URL",
         "REQUESTY_API_KEY",
         "REQUESTY_BASE_URL",
+        "ANYROUTER_API_KEY",
+        "ANYROUTER_BASE_URL",
         "DEEPSEEK_API_KEY",
         "DEEPSEEK_BASE_URL",
         "NVIDIA_API_KEY",
