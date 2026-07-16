@@ -102,10 +102,18 @@ _ZHIPU_CAPABILITIES = ProviderCapabilities(
 )
 
 _OPENAI_CODEX_CAPABILITIES = ProviderCapabilities("openai-codex", None, "OPENAI_CODEX_BASE_URL")
+_ANYROUTER_CAPABILITIES = ProviderCapabilities(
+    "anyrouter",
+    "ANYROUTER_API_KEY",
+    "ANYROUTER_BASE_URL",
+    capture_reasoning=True,
+)
 
 
 _PROVIDERS: dict[str, ProviderCapabilities] = {
     "openai": ProviderCapabilities("openai", "OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "anyrouter": _ANYROUTER_CAPABILITIES,
+    "anyrouter-responses": _ANYROUTER_CAPABILITIES,
     "openrouter": ProviderCapabilities(
         "openrouter",
         "OPENROUTER_API_KEY",

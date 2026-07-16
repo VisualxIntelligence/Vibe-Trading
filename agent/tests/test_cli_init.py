@@ -6,6 +6,17 @@ from unittest.mock import patch
 import cli
 
 
+def _provider_choice_number(provider: str) -> int:
+    """Resolve a CLI menu choice by provider identity, not list position."""
+    matches = [
+        index
+        for index, option in enumerate(cli._PROVIDER_CHOICES, start=1)
+        if option["provider"] == provider
+    ]
+    assert len(matches) == 1, f"expected one CLI choice for {provider!r}, got {len(matches)}"
+    return matches[0]
+
+
 class TestCliInit:
     def test_render_env_content_openrouter(self) -> None:
         content = cli._render_env_content(
@@ -56,7 +67,11 @@ class TestCliInit:
         env_path = tmp_path / ".env"
 
         with patch.object(cli, "_INIT_ENV_PATH", env_path), \
-             patch.object(cli.IntPrompt, "ask", return_value=1), \
+             patch.object(
+                 cli.IntPrompt,
+                 "ask",
+                 return_value=_provider_choice_number("openrouter"),
+             ), \
              patch.object(
                  cli.Prompt,
                  "ask",
@@ -81,7 +96,11 @@ class TestCliInit:
         env_path = tmp_path / ".env"
 
         with patch.object(cli, "_INIT_ENV_PATH", env_path), \
-             patch.object(cli.IntPrompt, "ask", return_value=14), \
+             patch.object(
+                 cli.IntPrompt,
+                 "ask",
+                 return_value=_provider_choice_number("ollama"),
+             ), \
              patch.object(
                  cli.Prompt,
                  "ask",
@@ -106,7 +125,11 @@ class TestCliInit:
         env_path = tmp_path / ".env"
 
         with patch.object(cli, "_INIT_ENV_PATH", env_path), \
-             patch.object(cli.IntPrompt, "ask", return_value=15), \
+             patch.object(
+                 cli.IntPrompt,
+                 "ask",
+                 return_value=_provider_choice_number("openai-codex"),
+             ), \
              patch.object(
                  cli.Prompt,
                  "ask",
@@ -124,3 +147,31 @@ class TestCliInit:
         assert "OPENAI_CODEX_BASE_URL=https://chatgpt.com/backend-api/codex/responses" in content
         assert "LANGCHAIN_MODEL_NAME=openai-codex/gpt-5.4" in content
         assert "OPENAI_API_KEY=" not in content
+
+    def test_cmd_init_anyrouter_uses_responses_provider(self, tmp_path: Path) -> None:
+        env_path = tmp_path / ".env"
+
+        with patch.object(cli, "_INIT_ENV_PATH", env_path), \
+             patch.object(
+                 cli.IntPrompt,
+                 "ask",
+                 return_value=_provider_choice_number("anyrouter"),
+             ), \
+             patch.object(
+                 cli.Prompt,
+                 "ask",
+                 side_effect=[
+                     "sk-test-key",
+                     "https://region.example/v1",
+                     "gpt-5.6-sol",
+                     "",
+                 ],
+             ):
+            result = cli.cmd_init()
+
+        assert result == 0
+        content = env_path.read_text(encoding="utf-8")
+        assert "LANGCHAIN_PROVIDER=anyrouter" in content
+        assert "ANYROUTER_API_KEY=sk-test-key" in content
+        assert "ANYROUTER_BASE_URL=https://region.example/v1" in content
+        assert "LANGCHAIN_MODEL_NAME=gpt-5.6-sol" in content

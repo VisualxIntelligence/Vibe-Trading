@@ -18,6 +18,15 @@
     "api_key_required": true
   },
   {
+    "name": "anyrouter",
+    "label": "AnyRouter.top (regional Responses API)",
+    "api_key_env": "ANYROUTER_API_KEY",
+    "base_url_env": "ANYROUTER_BASE_URL",
+    "default_model": "gpt-5.6-sol",
+    "default_base_url": "",
+    "api_key_required": true
+  },
+  {
     "name": "openai",
     "label": "OpenAI",
     "api_key_env": "OPENAI_API_KEY",

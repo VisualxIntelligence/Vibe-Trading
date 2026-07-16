@@ -135,6 +135,11 @@ class LLMConfig(_EnvBase):
         alias="OPENAI_CODEX_BASE_URL",
         default="https://chatgpt.com/backend-api/codex/responses",
     )
+    anyrouter_api_key: str = Field(alias="ANYROUTER_API_KEY", default="")
+    anyrouter_base_url: str = Field(
+        alias="ANYROUTER_BASE_URL",
+        default="",
+    )
     openai_model: str = Field(alias="OPENAI_MODEL", default="")
 
 
